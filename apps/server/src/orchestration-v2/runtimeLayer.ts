@@ -1,4 +1,5 @@
 import * as GuestShareService from "../guest/GuestShareService.ts";
+import * as ServerEnvironment from "../environment/ServerEnvironment.ts";
 import * as UsageLimitRecoveryWorker from "./UsageLimitRecoveryWorker.ts";
 import * as Scheduler from "../scheduling/Scheduler.ts";
 import * as Layer from "effect/Layer";
@@ -25,6 +26,9 @@ import * as CommandReceiptStore from "./CommandReceiptStore.ts";
 import * as ContextHandoffService from "./ContextHandoffService.ts";
 import * as EffectOutbox from "./EffectOutbox.ts";
 import * as EffectWorker from "./EffectWorker.ts";
+import * as MastraRunEventTransport from "./MastraRunEventTransport.ts";
+import * as MastraWorkflowMonitorEventSource from "./MastraWorkflowMonitorEventSource.ts";
+import * as ProcessRunner from "../processRunner.ts";
 import * as EventSink from "./EventSink.ts";
 import * as EventStore from "./EventStore.ts";
 import * as IdAllocator from "@t3tools/provider-core/server/IdAllocator";
@@ -314,6 +318,22 @@ const layerThreadTitleRegenerationProvided = ThreadTitleRegenerationService.laye
     Layer.mergeAll(layerThreadManagementProvided, ProjectStore.layer, TextGeneration.layer),
   ),
 );
+const layerMastraRunEventTransport = MastraRunEventTransport.layer.pipe(
+  Layer.provide(ProcessRunner.layer),
+);
+const layerMastraWorkflowMonitorEventSource = MastraWorkflowMonitorEventSource.layer.pipe(
+  Layer.provide(
+    Layer.mergeAll(
+      layerStores,
+      layerEventSink,
+      ProjectionStore.layer,
+      IdAllocator.layer,
+      layerMastraRunEventTransport,
+      ServerEnvironment.layerIdentity,
+      layerThreadManagementProvided,
+    ),
+  ),
+);
 const layerEffectExecutorProvided = EffectWorker.layerExecutor.pipe(
   Layer.provide(
     Layer.mergeAll(
@@ -325,6 +345,7 @@ const layerEffectExecutorProvided = EffectWorker.layerExecutor.pipe(
       layerRuntimeRequestServiceProvided,
       layerThreadTitleRegenerationProvided,
       layerThreadManagementProvided,
+      layerMastraWorkflowMonitorEventSource,
     ),
   ),
 );
@@ -360,6 +381,7 @@ export const layer = Layer.mergeAll(
   layerMcpAppRequestsProvided,
   layerThreadManagementProvided,
   layerEffectWorkerProvided,
+  layerMastraRunEventTransport,
   layerProviderSessionManagerProvided,
   layerProviderAuthServiceProvided,
   layerProviderRuntimeRecoveryProvided,

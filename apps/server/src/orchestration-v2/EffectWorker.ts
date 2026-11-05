@@ -38,6 +38,29 @@ export class OrchestrationEffectExecutionError extends Schema.TaggedError<Orches
   },
 ) {}
 
+export class MastraWorkflowMonitorEventSourceError extends Schema.TaggedError<MastraWorkflowMonitorEventSourceError>()(
+  "MastraWorkflowMonitorEventSourceError",
+  { message: Schema.String },
+) {}
+
+export interface MastraWorkflowMonitorEventSourceShape {
+  readonly register: (input: {
+    // This key must make registrations idempotent across retries and process recovery.
+    readonly effectId: string;
+    readonly threadId: string;
+    readonly runId: string;
+    readonly turnItemId: string;
+    readonly providerThreadId: string;
+    readonly mastraRunId: string;
+    readonly poll: number;
+  }) => Effect.Effect<void, MastraWorkflowMonitorEventSourceError>;
+}
+
+export class MastraWorkflowMonitorEventSource extends Context.Service<
+  MastraWorkflowMonitorEventSource,
+  MastraWorkflowMonitorEventSourceShape
+>()("t3/orchestration-v2/EffectWorker/MastraWorkflowMonitorEventSource") {}
+
 /**
  * Do not apply this to `provider-turn.restart`: that compound effect also runs
  * detach and start. Swallowing a start failure that happens to mention
@@ -94,10 +117,45 @@ export const layerExecutor: Layer.Layer<
       yield* ThreadTitleRegenerationService.ThreadTitleRegenerationService;
     const threads = yield* ThreadManagementService.ThreadManagementService;
     const settings = yield* ServerSettings.ServerSettingsService;
+    const mastraMonitorSource = yield* Effect.serviceOption(MastraWorkflowMonitorEventSource);
     return OrchestrationEffectExecutorV2.of({
       execute: Effect.fn("OrchestrationEffectExecutorV2.execute")(function (effect, options) {
         const willRetry = options?.willRetry ?? false;
         switch (effect.request.type) {
+          case "mastra-workflow.monitor": {
+            const request = effect.request;
+            if (Option.isNone(mastraMonitorSource)) {
+              return Effect.fail(
+                new OrchestrationEffectExecutionError({
+                  effectId: effect.id,
+                  effectType: request.type,
+                  cause: new MastraWorkflowMonitorEventSourceError({
+                    message: "Mastra workflow monitor event source is unavailable",
+                  }),
+                }),
+              );
+            }
+            return mastraMonitorSource.value
+              .register({
+                effectId: effect.id,
+                threadId: effect.threadId,
+                runId: request.runId,
+                turnItemId: request.turnItemId,
+                providerThreadId: request.providerThreadId,
+                mastraRunId: request.mastraRunId,
+                poll: request.poll,
+              })
+              .pipe(
+                Effect.mapError(
+                  (cause) =>
+                    new OrchestrationEffectExecutionError({
+                      effectId: effect.id,
+                      effectType: request.type,
+                      cause,
+                    }),
+                ),
+              );
+          }
           case "provider-runtime.continue": {
             const sourceRunId = effect.request.sourceRunId;
             return continueRestartedRun({ threadId: effect.threadId, sourceRunId }).pipe(
@@ -756,6 +814,7 @@ export const layerWithOptions = (
             return false;
           }
           const effect = claimed.value;
+          const keepMonitorPending = effect.request.type === "mastra-workflow.monitor";
           // Arm cancellation before rereading durable state to close the read-to-registration race.
           const cancellation = outbox
             .awaitCancellation(effect.id)
@@ -783,7 +842,7 @@ export const layerWithOptions = (
           if (cancelledBeforeExecution) return true;
 
           const execution = executor
-            .execute(effect, { willRetry: effect.attemptCount < maxAttempts })
+            .execute(effect, { willRetry: keepMonitorPending || effect.attemptCount < maxAttempts })
             .pipe(boundExecution(effect), Effect.as("executed" as const));
           const exit = yield* Effect.exit(Effect.raceFirst(execution, cancellation)).pipe(
             Effect.ensuring(outbox.clearCancellation(effect.id)),
@@ -819,7 +878,7 @@ export const layerWithOptions = (
             ? yield* outbox
                 .succeed({ effectId: effect.id, workerId })
                 .pipe(Effect.onError((cause) => terminalizeClaim(effect, cause)))
-            : effect.attemptCount >= maxAttempts
+            : !keepMonitorPending && effect.attemptCount >= maxAttempts
               ? yield* outbox
                   .fail({ effectId: effect.id, workerId, error })
                   .pipe(Effect.onError((cause) => terminalizeClaim(effect, cause)))

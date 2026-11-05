@@ -407,6 +407,52 @@ const layerBase: Layer.Layer<
       );
     });
 
+    const prepareMastraMonitorEffects = (events: ReadonlyArray<OrchestrationV2DomainEvent>) => {
+      const effects: Array<EffectOutbox.PendingOrchestrationEffectV2> = [];
+      const sanitized = events.map((event) => {
+        if (event.type !== "turn-item.updated" || event.payload.type !== "dynamic_tool") {
+          return event;
+        }
+        const output = event.payload.output;
+        if (output === null || typeof output !== "object" || Array.isArray(output)) return event;
+        const outputRecord = Object.fromEntries(Object.entries(output));
+        const marker = outputRecord["__t3MastraWorkflowMonitor"];
+        if (marker === null || typeof marker !== "object" || Array.isArray(marker)) return event;
+        const monitor = Object.fromEntries(Object.entries(marker));
+        const runId = monitor["runId"];
+        const mastraRunId = monitor["mastraRunId"];
+        if (
+          typeof runId !== "string" ||
+          typeof mastraRunId !== "string" ||
+          event.payload.providerThreadId === null ||
+          !/^[A-Za-z0-9:_-]{1,200}$/.test(mastraRunId)
+        )
+          return event;
+        const effectId = `effect:mastra-monitor:${event.threadId}:${event.payload.id}`;
+        effects.push({
+          id: effectId,
+          commandId: CommandId.make(effectId),
+          threadId: event.threadId,
+          request: {
+            type: "mastra-workflow.monitor",
+            runId: RunId.make(runId),
+            turnItemId: event.payload.id,
+            providerThreadId: event.payload.providerThreadId,
+            mastraRunId,
+            poll: 0,
+          },
+        });
+        const {
+          __t3MastraWorkflowMonitor: _privateMarker,
+          result,
+          ...visibleOutput
+        } = outputRecord;
+        const cleanOutput = result === undefined ? visibleOutput : result;
+        return { ...event, payload: { ...event.payload, output: cleanOutput } };
+      });
+      return { events: sanitized, effects };
+    };
+
     const writeEffect = Effect.fn("orchestrationV2.EventSink.write")(function* (
       input: Parameters<EventSinkV2Shape["writeWithEffects"]>[0],
     ) {
@@ -437,23 +483,25 @@ const layerBase: Layer.Layer<
           const events = input.updateDelegatedCompletionOnly
             ? yield* updateDelegatedCompletionOnly(input.events, () => true)
             : input.events;
+          const monitor = prepareMastraMonitorEffects(events);
           const normalized = yield* normalizeEvents(
             input.guardPendingUserInputCancellations === true
-              ? yield* guardUserInputCancellations(events)
-              : events,
+              ? yield* guardUserInputCancellations(monitor.events)
+              : monitor.events,
           );
           const committed = yield* eventStore.append({
             ...(input.commandId === undefined ? {} : { commandId: input.commandId }),
             events: normalized,
           });
           const outcomes = yield* applyStoredEvents(committed);
-          yield* effectOutbox.enqueue(input.effects);
-          return { committed, outcomes };
+          const effects = [...input.effects, ...monitor.effects];
+          yield* effectOutbox.enqueue(effects);
+          return { committed, outcomes, effectCount: effects.length };
         }).pipe(Effect.withTracerEnabled(false)),
-        ({ committed, outcomes }) =>
+        ({ committed, outcomes, effectCount }) =>
           Effect.gen(function* () {
-            if (input.effects.length > 0) {
-              yield* effectOutbox.notifyAvailable(input.effects.length);
+            if ((effectCount ?? 0) > 0) {
+              yield* effectOutbox.notifyAvailable(effectCount ?? 0);
             }
             yield* publishStoredEvents(committed, outcomes);
           }),
