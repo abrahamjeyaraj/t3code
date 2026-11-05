@@ -2,6 +2,7 @@ import {
   CheckpointId,
   CheckpointScopeId,
   CommandId,
+  NonNegativeInt,
   MessageId,
   NodeId,
   ProviderSessionId,
@@ -13,6 +14,7 @@ import {
   RunId,
   RuntimeRequestId,
   ThreadId,
+  TurnItemId,
 } from "@t3tools/contracts";
 import * as Context from "effect/Context";
 import * as NodeSqliteClient from "@t3tools/shared/nodeSqliteClient";
@@ -33,6 +35,14 @@ export const OrchestrationEffectRequestV2 = Schema.Union([
   Schema.Struct({
     type: Schema.Literal("provider-runtime.continue"),
     sourceRunId: RunId,
+  }),
+  Schema.Struct({
+    type: Schema.Literal("mastra-workflow.monitor"),
+    runId: Schema.String,
+    turnItemId: TurnItemId,
+    providerThreadId: ProviderThreadId,
+    mastraRunId: Schema.String,
+    poll: NonNegativeInt,
   }),
   Schema.Struct({
     type: Schema.Literal("provider-session.detach"),
@@ -124,6 +134,7 @@ export type OrchestrationEffectRequestV2 = typeof OrchestrationEffectRequestV2.T
 
 export const REPLAY_SAFE_EFFECT_TYPES_AFTER_PROCESS_LOSS = [
   "provider-runtime.continue",
+  "mastra-workflow.monitor",
   "provider-session.detach",
   "provider-thread.rollback",
   "checkpoint.capture",
@@ -171,6 +182,28 @@ export interface OrchestrationEffectV2 {
   readonly lastError: string | null;
 }
 
+export interface MastraWorkflowMonitorRegistration {
+  readonly effectId: string;
+  readonly consumerId: string;
+  readonly threadId: ThreadId;
+  readonly runId: RunId;
+  readonly turnItemId: TurnItemId;
+  readonly providerThreadId: ProviderThreadId;
+  readonly mastraRunId: string;
+}
+
+export interface MastraWorkflowTerminalIntent {
+  readonly consumerId: string;
+  readonly eventId: string;
+  readonly mastraRunId: string;
+  readonly threadId: ThreadId;
+  readonly turnItemId: TurnItemId;
+  readonly state: string;
+  readonly stage: string | null;
+  readonly outcomeJson: string;
+  readonly occurredAt: string;
+}
+
 export interface PendingOrchestrationEffectV2 {
   readonly id: string;
   readonly commandId: CommandId;
@@ -207,6 +240,33 @@ export interface EffectOutboxV2Shape {
   readonly listByCommandId: (
     commandId: CommandId,
   ) => Effect.Effect<ReadonlyArray<OrchestrationEffectV2>, EffectOutboxError>;
+  readonly registerMastraWorkflowMonitor: (input: {
+    readonly effectId: string;
+    readonly consumerId: string;
+    readonly threadId: ThreadId;
+    readonly runId: RunId;
+    readonly turnItemId: TurnItemId;
+    readonly providerThreadId: ProviderThreadId;
+    readonly mastraRunId: string;
+  }) => Effect.Effect<void, EffectOutboxError>;
+  readonly listMastraWorkflowMonitors: Effect.Effect<
+    ReadonlyArray<{
+      readonly effectId: string;
+      readonly consumerId: string;
+      readonly threadId: ThreadId;
+      readonly runId: RunId;
+      readonly turnItemId: TurnItemId;
+      readonly providerThreadId: ProviderThreadId;
+      readonly mastraRunId: string;
+    }>,
+    EffectOutboxError
+  >;
+  readonly recordMastraWorkflowTerminalIntent: (
+    input: MastraWorkflowTerminalIntent,
+  ) => Effect.Effect<void, EffectOutboxError>;
+  readonly listMastraWorkflowTerminalIntents: (input: {
+    readonly consumerId: string;
+  }) => Effect.Effect<ReadonlyArray<MastraWorkflowTerminalIntent>, EffectOutboxError>;
   readonly cancelUnsettled: (input: {
     readonly threadId: ThreadId;
     readonly effectTypes: ReadonlyArray<OrchestrationEffectRequestV2["type"]>;
@@ -291,6 +351,37 @@ export const layer: Layer.Layer<EffectOutboxV2, never, SqlClient.SqlClient> = La
   EffectOutboxV2,
   Effect.gen(function* () {
     const sql = yield* SqlClient.SqlClient;
+    yield* Effect.orDie(sql`CREATE TABLE IF NOT EXISTS orchestration_v2_mastra_workflow_monitors (
+      effect_id TEXT PRIMARY KEY,
+      consumer_id TEXT NOT NULL,
+      thread_id TEXT NOT NULL,
+      run_id TEXT NOT NULL,
+      turn_item_id TEXT NOT NULL,
+      provider_thread_id TEXT NOT NULL,
+      mastra_run_id TEXT NOT NULL
+    )`);
+    yield* Effect.orDie(sql`CREATE TABLE IF NOT EXISTS orchestration_v2_mastra_workflow_terminal_intents (
+      consumer_id TEXT NOT NULL,
+      event_id TEXT NOT NULL,
+      mastra_run_id TEXT NOT NULL,
+      thread_id TEXT NOT NULL,
+      turn_item_id TEXT NOT NULL,
+      state TEXT NOT NULL,
+      stage TEXT,
+      occurred_at TEXT NOT NULL,
+      outcome_json TEXT NOT NULL DEFAULT '{}',
+      PRIMARY KEY (consumer_id, event_id)
+    )`);
+    const terminalIntentColumns = yield* Effect.orDie(
+      sql<{
+        readonly name: string;
+      }>`PRAGMA table_info(orchestration_v2_mastra_workflow_terminal_intents)`,
+    );
+    if (!terminalIntentColumns.some((column) => column.name === "outcome_json")) {
+      yield* Effect.orDie(
+        sql`ALTER TABLE orchestration_v2_mastra_workflow_terminal_intents ADD COLUMN outcome_json TEXT NOT NULL DEFAULT '{}'`,
+      );
+    }
     const available = yield* Queue.dropping<void>(64);
     const cancellationSignals = new Map<string, Deferred.Deferred<void>>();
     const settledSignals = new Map<string, Deferred.Deferred<void>>();
@@ -436,6 +527,71 @@ export const layer: Layer.Layer<EffectOutboxV2, never, SqlClient.SqlClient> = La
               : new EffectOutboxError({ operation: "list", cause }),
           ),
         ),
+      registerMastraWorkflowMonitor: Effect.fn("EffectOutbox.registerMastraWorkflowMonitor")(
+        function* (input) {
+          yield* sql`
+            INSERT INTO orchestration_v2_mastra_workflow_monitors (
+              effect_id, consumer_id, thread_id, run_id, turn_item_id,
+              provider_thread_id, mastra_run_id
+            ) VALUES (
+              ${input.effectId}, ${input.consumerId}, ${input.threadId}, ${input.runId},
+              ${input.turnItemId}, ${input.providerThreadId}, ${input.mastraRunId}
+            ) ON CONFLICT(effect_id) DO NOTHING
+          `;
+          const rows = yield* sql<{ readonly matches: number }>`
+            SELECT COUNT(*) AS matches
+            FROM orchestration_v2_mastra_workflow_monitors
+            WHERE effect_id = ${input.effectId}
+              AND consumer_id = ${input.consumerId}
+              AND thread_id = ${input.threadId}
+              AND run_id = ${input.runId}
+              AND turn_item_id = ${input.turnItemId}
+              AND provider_thread_id = ${input.providerThreadId}
+              AND mastra_run_id = ${input.mastraRunId}
+          `;
+          if (rows[0]?.matches !== 1) {
+            return yield* new EffectOutboxError({
+              operation: "register-mastra-monitor",
+              effectId: input.effectId,
+            });
+          }
+        },
+        Effect.mapError((cause) =>
+          isEffectOutboxError(cause)
+            ? cause
+            : new EffectOutboxError({ operation: "register-mastra-monitor", cause }),
+        ),
+      ),
+      listMastraWorkflowMonitors: sql<{
+        readonly effect_id: string;
+        readonly consumer_id: string;
+        readonly thread_id: string;
+        readonly run_id: string;
+        readonly turn_item_id: string;
+        readonly provider_thread_id: string;
+        readonly mastra_run_id: string;
+      }>`
+        SELECT effect_id, consumer_id, thread_id, run_id, turn_item_id,
+          provider_thread_id, mastra_run_id
+        FROM orchestration_v2_mastra_workflow_monitors
+        ORDER BY effect_id
+      `.pipe(
+        NodeSqliteClient.readOnly,
+        Effect.map((rows) =>
+          rows.map((row) => ({
+            effectId: row.effect_id,
+            consumerId: row.consumer_id,
+            threadId: ThreadId.make(row.thread_id),
+            runId: RunId.make(row.run_id),
+            turnItemId: TurnItemId.make(row.turn_item_id),
+            providerThreadId: ProviderThreadId.make(row.provider_thread_id),
+            mastraRunId: row.mastra_run_id,
+          })),
+        ),
+        Effect.mapError(
+          (cause) => new EffectOutboxError({ operation: "list-mastra-monitors", cause }),
+        ),
+      ),
       cancelUnsettled: Effect.fn("EffectOutbox.cancelUnsettled")(
         function* ({ threadId, effectTypes, reason }) {
           if (effectTypes.length === 0) return [];
@@ -517,6 +673,81 @@ export const layer: Layer.Layer<EffectOutboxV2, never, SqlClient.SqlClient> = La
           (cause) => new EffectOutboxError({ operation: "reconcile-process-loss", cause }),
         ),
       ),
+      recordMastraWorkflowTerminalIntent: Effect.fn(
+        "EffectOutbox.recordMastraWorkflowTerminalIntent",
+      )(
+        function* (input) {
+          yield* sql`
+          INSERT INTO orchestration_v2_mastra_workflow_terminal_intents (
+            consumer_id, event_id, mastra_run_id, thread_id, turn_item_id,
+            state, stage, occurred_at, outcome_json
+          ) VALUES (
+            ${input.consumerId}, ${input.eventId}, ${input.mastraRunId},
+            ${input.threadId}, ${input.turnItemId}, ${input.state},
+            ${input.stage}, ${input.occurredAt}, ${input.outcomeJson}
+          ) ON CONFLICT(consumer_id, event_id) DO NOTHING
+        `;
+          const rows = yield* sql<{ readonly matches: number }>`
+          SELECT COUNT(*) AS matches
+          FROM orchestration_v2_mastra_workflow_terminal_intents
+          WHERE consumer_id = ${input.consumerId}
+            AND event_id = ${input.eventId}
+            AND mastra_run_id = ${input.mastraRunId}
+            AND thread_id = ${input.threadId}
+            AND turn_item_id = ${input.turnItemId}
+            AND state = ${input.state}
+            AND stage IS ${input.stage}
+            AND occurred_at = ${input.occurredAt}
+            AND outcome_json = ${input.outcomeJson}
+        `;
+          if (rows[0]?.matches !== 1) {
+            return yield* new EffectOutboxError({ operation: "record-mastra-terminal-intent" });
+          }
+        },
+        Effect.mapError((cause) =>
+          isEffectOutboxError(cause)
+            ? cause
+            : new EffectOutboxError({ operation: "record-mastra-terminal-intent", cause }),
+        ),
+      ),
+      listMastraWorkflowTerminalIntents: (input) =>
+        sql<{
+          readonly consumer_id: string;
+          readonly event_id: string;
+          readonly mastra_run_id: string;
+          readonly thread_id: string;
+          readonly turn_item_id: string;
+          readonly state: string;
+          readonly stage: string | null;
+          readonly occurred_at: string;
+          readonly outcome_json: string;
+        }>`
+          SELECT consumer_id, event_id, mastra_run_id, thread_id, turn_item_id,
+            state, stage, occurred_at, outcome_json
+          FROM orchestration_v2_mastra_workflow_terminal_intents
+          WHERE consumer_id = ${input.consumerId}
+          ORDER BY occurred_at, event_id
+        `.pipe(
+          NodeSqliteClient.readOnly,
+          Effect.map((rows) =>
+            rows.map((row) => ({
+              consumerId: row.consumer_id,
+              eventId: row.event_id,
+              mastraRunId: row.mastra_run_id,
+              threadId: ThreadId.make(row.thread_id),
+              turnItemId: TurnItemId.make(row.turn_item_id),
+              state: row.state,
+              stage: row.stage,
+              occurredAt: row.occurred_at,
+              outcomeJson: row.outcome_json,
+            })),
+          ),
+          Effect.mapError((cause) =>
+            isEffectOutboxError(cause)
+              ? cause
+              : new EffectOutboxError({ operation: "list-mastra-terminal-intents", cause }),
+          ),
+        ),
       // The worker polls for the next effect even when there is no work to claim.
       claimNext: Effect.fnUntraced(
         function* ({ workerId, excludeRestartContinuations = false }) {

@@ -86,6 +86,21 @@ const isProviderAdapterEventStreamError = Schema.is(
 );
 const encodeUnknownJson = Schema.encodeUnknownSync(Schema.fromJsonString(Schema.Unknown));
 
+describe("CodexAdapterV2 durable Mastra monitoring opt-in", () => {
+  it("uses the session poller only when the durable event transport is unset", () => {
+    const previousHost = process.env.T3_MASTRA_EVENT_HOST;
+    try {
+      delete process.env.T3_MASTRA_EVENT_HOST;
+      assert.isFalse(CodexAdapterV2.durableMastraMonitoringEnabled());
+      process.env.T3_MASTRA_EVENT_HOST = "mini-host";
+      assert.isTrue(CodexAdapterV2.durableMastraMonitoringEnabled());
+    } finally {
+      if (previousHost === undefined) delete process.env.T3_MASTRA_EVENT_HOST;
+      else process.env.T3_MASTRA_EVENT_HOST = previousHost;
+    }
+  });
+});
+
 describe("CodexAdapterV2 context usage", () => {
   it("uses the current context rather than cumulative processed tokens", () => {
     const usage = CodexAdapterV2.codexProviderTurnTokenUsage(
@@ -6440,6 +6455,598 @@ describe("CodexAdapterV2 post-settle continuation", () => {
           MCP_APP_RESOURCE,
         );
         assert.deepEqual(output.result, { ...MCP_APP_DEFERRED_RESULT, isError: true });
+        assert.isFalse(yield* harness.hasPendingBackgroundWork);
+      }).pipe(
+        Effect.provide(
+          Layer.mergeAll(
+            IdAllocator.layer,
+            McpProviderSessions.layer,
+            NodeServices.layer,
+            NodeCrypto.layer,
+          ),
+        ),
+      ),
+    ),
+  );
+
+  const MASTRA_RUN_SCENARIO = "codex-mastra-run-tracking";
+  const MASTRA_RUN_NATIVE_THREAD = "native-codex-mastra-run-thread";
+  const MASTRA_RUN_NATIVE_TURN = "native-codex-mastra-run-turn";
+  const MASTRA_RUN_ITEM = "mcp-mastra-worker-call";
+  const MASTRA_RUN_ID = "run:worker:fixture-42";
+  const mastraRunItem = (status: "inProgress" | "completed") => ({
+    type: "mcpToolCall",
+    id: MASTRA_RUN_ITEM,
+    server: "mastra",
+    tool: "mastra_workflow_worker",
+    status,
+    arguments: { workspace: "/tmp/example", prompt: "private prompt fixture" },
+    ...(status === "completed"
+      ? {
+          result: {
+            content: [
+              {
+                type: "text",
+                text: JSON.stringify({ runId: MASTRA_RUN_ID, workflow: "workerWorkflow" }),
+              },
+            ],
+          },
+        }
+      : {}),
+  });
+  const mastraRunTranscript = makeCodexReplayTranscript({
+    scenario: MASTRA_RUN_SCENARIO,
+    entries: [
+      ...codexReplayPreamble({
+        nativeThreadId: MASTRA_RUN_NATIVE_THREAD,
+        nativeTurnId: MASTRA_RUN_NATIVE_TURN,
+        prompt: "Run a background workflow.",
+      }),
+      {
+        type: "emit_inbound",
+        label: "item/started/mastra-workflow",
+        frame: {
+          method: "item/started",
+          params: {
+            item: mastraRunItem("inProgress"),
+            threadId: MASTRA_RUN_NATIVE_THREAD,
+            turnId: MASTRA_RUN_NATIVE_TURN,
+            startedAtMs: 1782622440500,
+          },
+        },
+      },
+      {
+        type: "emit_inbound",
+        label: "item/completed/mastra-workflow",
+        frame: {
+          method: "item/completed",
+          params: {
+            item: mastraRunItem("completed"),
+            threadId: MASTRA_RUN_NATIVE_THREAD,
+            turnId: MASTRA_RUN_NATIVE_TURN,
+            completedAtMs: 1782622441500,
+          },
+        },
+      },
+      {
+        type: "expect_outbound",
+        label: "mastra_status",
+        frame: {
+          id: 4,
+          method: "mcpServer/tool/call",
+          params: {
+            threadId: MASTRA_RUN_NATIVE_THREAD,
+            server: "mastra",
+            tool: "mastra_status",
+            arguments: { runId: MASTRA_RUN_ID },
+          },
+        },
+      },
+      {
+        type: "emit_inbound",
+        label: "mastra_status",
+        frame: {
+          id: 4,
+          result: {
+            content: [
+              {
+                type: "text",
+                text: JSON.stringify({
+                  runId: MASTRA_RUN_ID,
+                  workflow: "workerWorkflow",
+                  state: "running",
+                  currentStep: "worker",
+                  elapsedSec: 18,
+                  reason: "status-only secret fixture",
+                  lastError: "status-only secret fixture",
+                }),
+              },
+            ],
+          },
+        },
+      },
+      {
+        type: "expect_outbound",
+        label: "mastra_status-final",
+        frame: {
+          id: 5,
+          method: "mcpServer/tool/call",
+          params: {
+            threadId: MASTRA_RUN_NATIVE_THREAD,
+            server: "mastra",
+            tool: "mastra_status",
+            arguments: { runId: MASTRA_RUN_ID },
+          },
+        },
+      },
+      {
+        type: "emit_inbound",
+        label: "mastra_status-final",
+        frame: {
+          id: 5,
+          result: {
+            content: [
+              {
+                type: "text",
+                text: JSON.stringify({
+                  runId: MASTRA_RUN_ID,
+                  workflow: "workerWorkflow",
+                  state: "done",
+                  currentStep: "worker",
+                  elapsedSec: 23,
+                }),
+              },
+            ],
+          },
+        },
+      },
+      {
+        type: "expect_outbound",
+        label: "mastra_result",
+        frame: {
+          id: 6,
+          method: "mcpServer/tool/call",
+          params: {
+            threadId: MASTRA_RUN_NATIVE_THREAD,
+            server: "mastra",
+            tool: "mastra_result",
+            arguments: { runId: MASTRA_RUN_ID },
+          },
+        },
+      },
+      {
+        type: "emit_inbound",
+        label: "item/completed/mastra-workflow-duplicate",
+        frame: {
+          method: "item/completed",
+          params: {
+            item: mastraRunItem("completed"),
+            threadId: MASTRA_RUN_NATIVE_THREAD,
+            turnId: MASTRA_RUN_NATIVE_TURN,
+            completedAtMs: 1782622441501,
+          },
+        },
+      },
+      {
+        type: "emit_inbound",
+        label: "turn/completed",
+        frame: {
+          method: "turn/completed",
+          params: {
+            threadId: MASTRA_RUN_NATIVE_THREAD,
+            turn: makeCodexReplayTurn({ id: MASTRA_RUN_NATIVE_TURN, status: "completed" }),
+          },
+        },
+      },
+      {
+        type: "emit_inbound",
+        label: "mastra_result",
+        frame: {
+          id: 6,
+          result: {
+            content: [
+              {
+                type: "text",
+                text: `workerWorkflow done\n\nWorker finished successfully.\n\nreceipt: {"provider":"codex","ranModel":"luna","requested":{"prompt":"private prompt fixture"}}`,
+              },
+            ],
+          },
+        },
+      },
+    ],
+  });
+
+  const mastraExecWrappedTranscript = makeCodexReplayTranscript({
+    ...mastraRunTranscript,
+    scenario: `${MASTRA_RUN_SCENARIO}-functions-exec-wrapper`,
+    entries: mastraRunTranscript.entries.map((entry) => {
+      if (entry.type !== "emit_inbound" || !Predicate.isObject(entry.frame)) return entry;
+      const params = Reflect.get(entry.frame, "params");
+      if (!Predicate.isObject(params)) return entry;
+      const item = Reflect.get(params, "item");
+      if (!Predicate.isObject(item) || Reflect.get(item, "type") !== "mcpToolCall") return entry;
+      const status = Reflect.get(item, "status");
+      return {
+        ...entry,
+        frame: {
+          ...entry.frame,
+          params: {
+            ...params,
+            item: {
+              type: "dynamicToolCall",
+              id: MASTRA_RUN_ITEM,
+              tool: "functions.exec",
+              arguments: {},
+              status,
+              contentItems:
+                status === "completed"
+                  ? [
+                      {
+                        type: "inputText",
+                        text: JSON.stringify({
+                          content: [
+                            {
+                              type: "text",
+                              text: JSON.stringify({
+                                runId: MASTRA_RUN_ID,
+                                workflow: "workerWorkflow",
+                              }),
+                            },
+                          ],
+                        }),
+                      },
+                    ]
+                  : [],
+            },
+          },
+        },
+      };
+    }),
+  });
+
+  const mastraRunTranscriptForTerminalState = (state: "failed" | "cancelled") =>
+    makeCodexReplayTranscript({
+      scenario: `${MASTRA_RUN_SCENARIO}-${state}`,
+      entries: mastraRunTranscript.entries.flatMap((entry) => {
+        const label = entry.type === "runtime_exit" ? undefined : entry.label;
+        if (label === "mastra_status-final") return [];
+        if (
+          entry.type === "emit_inbound" &&
+          label === "mastra_status" &&
+          Predicate.isObject(entry.frame)
+        ) {
+          const result = Reflect.get(entry.frame, "result");
+          if (!Predicate.isObject(result)) return [entry];
+          return [
+            {
+              ...entry,
+              frame: {
+                ...entry.frame,
+                result: {
+                  ...result,
+                  content: [
+                    {
+                      type: "text",
+                      text: JSON.stringify({
+                        runId: MASTRA_RUN_ID,
+                        workflow: "workerWorkflow",
+                        state,
+                        currentStep: "worker",
+                        elapsedSec: 23,
+                      }),
+                    },
+                  ],
+                },
+              },
+            },
+          ];
+        }
+        return label === "mastra_result" ? [withReplayRequestId(entry, 5)] : [entry];
+      }),
+    });
+
+  const mastraRunTranscriptForStatusDisconnect = () =>
+    makeCodexReplayTranscript({
+      scenario: `${MASTRA_RUN_SCENARIO}-status-disconnect`,
+      entries: mastraRunTranscript.entries.flatMap((entry) => {
+        const label = entry.type === "runtime_exit" ? undefined : entry.label;
+        if (label === "mastra_status-final" || label === "mastra_result") return [];
+        if (
+          entry.type === "emit_inbound" &&
+          label === "mastra_status" &&
+          Predicate.isObject(entry.frame)
+        ) {
+          const result = Reflect.get(entry.frame, "result");
+          if (!Predicate.isObject(result)) return [entry];
+          return [
+            {
+              ...entry,
+              frame: {
+                ...entry.frame,
+                error: { code: -32000, message: "connection closed" },
+              },
+            },
+          ];
+        }
+        return [entry];
+      }),
+    });
+
+  it.effect("updates the originating Mastra tool item through detached completion", () =>
+    Effect.scoped(
+      Effect.gen(function* () {
+        const requests: Array<{ method: string; params: unknown }> = [];
+        const harness = yield* makeCodexReplayHarness(
+          mastraRunTranscript,
+          () => Effect.void,
+          (method, params) =>
+            Effect.sync(() => {
+              requests.push({ method, params });
+            }),
+        );
+        const now = yield* DateTime.now;
+        yield* harness.runtime.startTurn(
+          makeCodexTestTurnInput({
+            threadId: harness.threadId,
+            providerThread: harness.providerThread,
+            now,
+            attemptId: RunAttemptId.make("attempt-codex-mastra-run-tracking"),
+            text: "Run a background workflow.",
+          }),
+        );
+        yield* harness.until(() =>
+          harness.events.some(
+            (event) =>
+              event.type === "turn_item.updated" &&
+              event.turnItem.type === "dynamic_tool" &&
+              event.turnItem.nativeItemRef?.nativeId === MASTRA_RUN_ITEM &&
+              JSON.stringify(event.turnItem.output ?? "").includes("Step: worker"),
+          ),
+        );
+        assert.lengthOf(harness.continuationRequests, 0, "ordinary progress stays UI-only");
+        yield* TestClock.adjust("15 seconds");
+        yield* harness.until(() =>
+          harness.events.some(
+            (event) =>
+              event.type === "turn_item.updated" &&
+              event.turnItem.type === "dynamic_tool" &&
+              event.turnItem.nativeItemRef?.nativeId === MASTRA_RUN_ITEM &&
+              event.turnItem.status === "completed" &&
+              JSON.stringify(event.turnItem.output ?? "").includes("Worker finished successfully."),
+          ),
+        );
+        const updates = harness.events.filter(
+          (event) =>
+            event.type === "turn_item.updated" &&
+            event.turnItem.type === "dynamic_tool" &&
+            event.turnItem.nativeItemRef?.nativeId === MASTRA_RUN_ITEM,
+        );
+        assert.isAtLeast(updates.length, 3);
+        assert.isTrue(
+          updates.some(
+            (event) => event.type === "turn_item.updated" && event.turnItem.status === "running",
+          ),
+        );
+        assert.isTrue(JSON.stringify(updates).includes("Step: worker"));
+        assert.isFalse(
+          JSON.stringify(
+            updates.flatMap((event) =>
+              event.type === "turn_item.updated" && event.turnItem.type === "dynamic_tool"
+                ? event.turnItem.output
+                : undefined,
+            ),
+          ).includes("private prompt fixture"),
+        );
+        assert.isFalse(JSON.stringify(updates).includes("status-only secret fixture"));
+        assert.isTrue(JSON.stringify(updates).includes("ranModel"));
+        assert.isFalse(JSON.stringify(updates).includes('"requested"'));
+        assert.equal(
+          requests.filter(
+            ({ method, params }) =>
+              method === "mcpServer/tool/call" &&
+              params !== null &&
+              typeof params === "object" &&
+              ["mastra_status", "mastra_result"].includes(String(Reflect.get(params, "tool"))),
+          ).length,
+          3,
+        );
+        assert.lengthOf(harness.continuationRequests, 1, "terminal state wakes the thread once");
+        assert.include(
+          harness.continuationRequests[0]?.detail ?? "",
+          "Worker finished successfully.",
+        );
+        yield* harness.awaitTerminal(1);
+        assert.isFalse(yield* harness.hasPendingBackgroundWork);
+      }).pipe(
+        Effect.provide(
+          Layer.mergeAll(
+            IdAllocator.layer,
+            McpProviderSessions.layer,
+            NodeServices.layer,
+            NodeCrypto.layer,
+          ),
+        ),
+      ),
+    ),
+  );
+
+  it.effect("tracks the installed functions.exec MCP bridge result envelope", () =>
+    Effect.scoped(
+      Effect.gen(function* () {
+        const calls: Array<{ method: string; params: unknown }> = [];
+        const harness = yield* makeCodexReplayHarness(
+          mastraExecWrappedTranscript,
+          () => Effect.void,
+          (method, params) => Effect.sync(() => calls.push({ method, params })),
+        );
+        const now = yield* DateTime.now;
+        yield* harness.runtime.startTurn(
+          makeCodexTestTurnInput({
+            threadId: harness.threadId,
+            providerThread: harness.providerThread,
+            now,
+            attemptId: RunAttemptId.make("attempt-codex-mastra-functions-exec"),
+            text: "Run a background workflow.",
+          }),
+        );
+        yield* Effect.yieldNow;
+        yield* TestClock.adjust("15 seconds");
+        yield* harness.until(() => harness.continuationRequests.length === 1);
+        assert.equal(
+          calls.filter(
+            ({ params }) =>
+              params !== null &&
+              typeof params === "object" &&
+              Reflect.get(params, "tool") === "mastra_status",
+          ).length,
+          2,
+        );
+        assert.include(
+          harness.continuationRequests[0]?.detail ?? "",
+          "Worker finished successfully.",
+        );
+        assert.lengthOf(
+          harness.continuationRequests,
+          1,
+          "only the terminal result queues a model wake",
+        );
+      }).pipe(
+        Effect.provide(
+          Layer.mergeAll(
+            IdAllocator.layer,
+            McpProviderSessions.layer,
+            NodeServices.layer,
+            NodeCrypto.layer,
+          ),
+        ),
+      ),
+    ),
+  );
+
+  it.effect.each(["failed", "cancelled"] as const)(
+    "preserves detached Mastra run terminal state: $",
+    (state) =>
+      Effect.scoped(
+        Effect.gen(function* () {
+          const requests: Array<{ method: string; params: unknown }> = [];
+          const harness = yield* makeCodexReplayHarness(
+            mastraRunTranscriptForTerminalState(state),
+            () => Effect.void,
+            (method, params) =>
+              Effect.sync(() => {
+                requests.push({ method, params });
+              }),
+          );
+          const now = yield* DateTime.now;
+          yield* harness.runtime.startTurn(
+            makeCodexTestTurnInput({
+              threadId: harness.threadId,
+              providerThread: harness.providerThread,
+              now,
+              attemptId: RunAttemptId.make(`attempt-codex-mastra-${state}`),
+              text: "Run a background workflow.",
+            }),
+          );
+          yield* harness.until(() =>
+            harness.events.some(
+              (event) =>
+                event.type === "turn_item.updated" &&
+                event.turnItem.type === "dynamic_tool" &&
+                event.turnItem.nativeItemRef?.nativeId === MASTRA_RUN_ITEM &&
+                event.turnItem.status === state,
+            ),
+          );
+          const terminal = harness.events.find(
+            (event) =>
+              event.type === "turn_item.updated" &&
+              event.turnItem.type === "dynamic_tool" &&
+              event.turnItem.nativeItemRef?.nativeId === MASTRA_RUN_ITEM &&
+              event.turnItem.status === state,
+          );
+          assert.isDefined(terminal);
+          assert.equal(
+            requests.filter(
+              ({ params }) =>
+                params !== null &&
+                typeof params === "object" &&
+                Reflect.get(params, "tool") === "mastra_result",
+            ).length,
+            1,
+          );
+          assert.lengthOf(harness.continuationRequests, 1);
+          assert.equal(harness.continuationRequests[0]?.notification?.outcome, state);
+          assert.isFalse(yield* harness.hasPendingBackgroundWork);
+        }).pipe(
+          Effect.provide(
+            Layer.mergeAll(
+              IdAllocator.layer,
+              McpProviderSessions.layer,
+              NodeServices.layer,
+              NodeCrypto.layer,
+            ),
+          ),
+        ),
+      ),
+  );
+
+  it.effect("keeps a detached Mastra run nonterminal after status disconnect", () =>
+    Effect.scoped(
+      Effect.gen(function* () {
+        const requests: Array<{ method: string; params: unknown }> = [];
+        const harness = yield* makeCodexReplayHarness(
+          mastraRunTranscriptForStatusDisconnect(),
+          () => Effect.void,
+          (method, params) =>
+            Effect.sync(() => {
+              requests.push({ method, params });
+            }),
+        );
+        const now = yield* DateTime.now;
+        yield* harness.runtime.startTurn(
+          makeCodexTestTurnInput({
+            threadId: harness.threadId,
+            providerThread: harness.providerThread,
+            now,
+            attemptId: RunAttemptId.make("attempt-codex-mastra-status-disconnect"),
+            text: "Run a background workflow.",
+          }),
+        );
+        yield* harness.until(() =>
+          harness.events.some(
+            (event) =>
+              event.type === "turn_item.updated" &&
+              event.turnItem.type === "dynamic_tool" &&
+              event.turnItem.nativeItemRef?.nativeId === MASTRA_RUN_ITEM &&
+              event.turnItem.status === "running" &&
+              JSON.stringify(event.turnItem.output ?? "").includes("could not update its status"),
+          ),
+        );
+        const updates = harness.events.filter(
+          (event) =>
+            event.type === "turn_item.updated" &&
+            event.turnItem.type === "dynamic_tool" &&
+            event.turnItem.nativeItemRef?.nativeId === MASTRA_RUN_ITEM,
+        );
+        assert.isTrue(
+          updates.some(
+            (event) => event.type === "turn_item.updated" && event.turnItem.status === "running",
+          ),
+        );
+        assert.equal(
+          requests.filter(
+            ({ params }) =>
+              params !== null &&
+              typeof params === "object" &&
+              Reflect.get(params, "tool") === "mastra_result",
+          ).length,
+          0,
+        );
+        assert.lengthOf(harness.continuationRequests, 1);
+        assert.equal(harness.continuationRequests[0]?.notification?.outcome, "updated");
+        const lastUpdate = updates.at(-1);
+        if (lastUpdate?.type === "turn_item.updated") {
+          assert.notEqual(lastUpdate.turnItem.status, "completed");
+        }
         assert.isFalse(yield* harness.hasPendingBackgroundWork);
       }).pipe(
         Effect.provide(

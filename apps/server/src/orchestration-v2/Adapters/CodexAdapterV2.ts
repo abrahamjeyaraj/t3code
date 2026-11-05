@@ -510,6 +510,135 @@ function codexMcpAppResourceUri(item: CodexDynamicToolItem): string | undefined 
   return typeof uri === "string" && uri.startsWith(MCP_APP_RESOURCE_SCHEME) ? uri : undefined;
 }
 
+const MASTRA_RUN_POLL_INTERVAL_MS = 5_000;
+// Mastra workerWorkflow supports runs up to 60 minutes. Keep the upper bound
+// aligned with that contract; this is an app-server fiber, never model polling.
+export const CODEX_MASTRA_RUN_POLL_LIMIT = 720;
+export const durableMastraMonitoringEnabled = () =>
+  typeof process.env.T3_MASTRA_EVENT_HOST === "string" &&
+  process.env.T3_MASTRA_EVENT_HOST.length > 0;
+const MASTRA_RESULT_MAX_CHARS = 12_000;
+const MastraRunIdentity = Schema.Struct({ runId: Schema.String });
+const decodeMastraRunIdentity = Schema.decodeUnknownOption(MastraRunIdentity);
+const decodeMastraRunIdentityText = Schema.decodeUnknownOption(
+  Schema.fromJsonString(MastraRunIdentity),
+);
+const MastraRunStatus = Schema.Struct({
+  state: Schema.optional(Schema.Literals(["queued", "running", "done", "failed", "cancelled"])),
+  currentStep: Schema.optional(Schema.String),
+  elapsedSec: Schema.optional(Schema.Number),
+});
+const decodeMastraRunStatus = Schema.decodeUnknownOption(Schema.fromJsonString(MastraRunStatus));
+const decodeMastraTextContent = Schema.decodeUnknownOption(
+  Schema.Struct({ type: Schema.Literal("text"), text: Schema.String }),
+);
+
+function isMastraWorkflowCall(item: CodexDynamicToolItem): boolean {
+  return mastraRunId(item) !== undefined;
+}
+
+function parseMastraRunId(value: unknown): string | undefined {
+  const structured = value;
+  if (structured !== null && typeof structured === "object" && !Array.isArray(structured)) {
+    const runId = Option.getOrElse(decodeMastraRunIdentity(structured), () => ({
+      runId: undefined,
+    })).runId;
+    if (typeof runId === "string" && /^[A-Za-z0-9:_-]{1,200}$/.test(runId)) return runId;
+  }
+  const content =
+    structured !== null && typeof structured === "object" && !Array.isArray(structured)
+      ? Reflect.get(structured, "content")
+      : undefined;
+  if (!Array.isArray(content)) return undefined;
+  for (const entry of content) {
+    if (entry === null || typeof entry !== "object" || Reflect.get(entry, "type") !== "text")
+      continue;
+    const runId = Option.getOrElse(decodeMastraRunIdentityText(Reflect.get(entry, "text")), () => ({
+      runId: undefined,
+    })).runId;
+    if (typeof runId === "string" && /^[A-Za-z0-9:_-]{1,200}$/.test(runId)) return runId;
+  }
+  return undefined;
+}
+
+function mastraRunId(item: CodexDynamicToolItem): string | undefined {
+  if (item.type === "mcpToolCall") {
+    if (item.server.toLowerCase() !== "mastra" || !item.tool.startsWith("mastra_workflow_"))
+      return undefined;
+    return parseMastraRunId(item.result?.structuredContent) ?? parseMastraRunId(item.result);
+  }
+  // functions.exec is T3's installed Codex bridge path. Read only its returned
+  // tool-result envelope; never interpret text as another command or endpoint.
+  if (item.tool !== "functions.exec") return undefined;
+  for (const content of item.contentItems ?? []) {
+    if (content.type !== "inputText") continue;
+    const outer = Option.getOrElse(decodeMastraRunIdentityText(content.text), () => undefined);
+    if (outer !== undefined && /^[A-Za-z0-9:_-]{1,200}$/.test(outer.runId)) return outer.runId;
+    try {
+      const envelope: unknown = JSON.parse(content.text);
+      const result = parseMastraRunId(envelope);
+      if (result !== undefined) return result;
+      if (envelope !== null && typeof envelope === "object" && !Array.isArray(envelope)) {
+        const nested = Reflect.get(envelope, "result");
+        const nestedId = parseMastraRunId(nested);
+        if (nestedId !== undefined) return nestedId;
+      }
+    } catch {
+      // Non-JSON tool output is not a Mastra run identity.
+    }
+  }
+  return undefined;
+}
+
+function mastraToolText(response: CodexSchema.V2McpServerToolCallResponse): string {
+  const structuredContent = response.structuredContent;
+  if (
+    structuredContent !== undefined &&
+    structuredContent !== null &&
+    typeof structuredContent === "object" &&
+    !Array.isArray(structuredContent)
+  ) {
+    return JSON.stringify(structuredContent);
+  }
+  return response.content
+    .flatMap((entry) => {
+      const textContent = decodeMastraTextContent(entry);
+      return Option.isSome(textContent) ? [textContent.value.text] : [];
+    })
+    .join("\n");
+}
+
+function sanitizeMastraResult(text: string): string {
+  const marker = "\n\nreceipt: ";
+  const receiptIndex = text.lastIndexOf(marker);
+  if (receiptIndex < 0) return text;
+  try {
+    const receipt: unknown = JSON.parse(text.slice(receiptIndex + marker.length));
+    if (receipt === null || typeof receipt !== "object" || Array.isArray(receipt)) {
+      return text.slice(0, receiptIndex);
+    }
+    const visible = Object.fromEntries(
+      [
+        "provider",
+        "requestedModel",
+        "ranModel",
+        "account",
+        "seconds",
+        "pick",
+        "reviewer",
+        "git",
+        "testSkips",
+      ].flatMap((key) => {
+        const value = Reflect.get(receipt, key);
+        return value === undefined ? [] : [[key, value]];
+      }),
+    );
+    return `${text.slice(0, receiptIndex)}${marker}${JSON.stringify(visible)}`;
+  } catch {
+    return text.slice(0, receiptIndex);
+  }
+}
+
 const CODEX_IMAGE_DATA_URL = /^data:(image\/[a-z0-9.+-]+);base64,([A-Za-z0-9+/=]+)$/i;
 
 export function codexDynamicToolOutput(
@@ -1252,6 +1381,7 @@ interface TrackedRunningCommandItem {
 }
 
 function isPersistentCodexDynamicTool(item: CodexDynamicToolItem): boolean {
+  if (isMastraWorkflowCall(item)) return true;
   const input = item.arguments;
   if (input === null || typeof input !== "object" || Array.isArray(input)) {
     return false;
@@ -1963,6 +2093,7 @@ export const makeCodexAdapterV2 = Effect.fn("makeCodexAdapterV2")(function* (
         const runningDynamicToolsByTurn = yield* Ref.make(
           new Map<string, Map<string, CodexDynamicToolItem>>(),
         );
+        const trackedMastraWorkflowItems = yield* Ref.make(new Set<string>());
         const interruptingNativeTurns = yield* Ref.make(new Set<string>());
         const terminalizedNonCompletedNativeTurns = yield* Ref.make(new Set<string>());
         // Keep the stream open until descendants settle to avoid stranding child projections.
@@ -3997,6 +4128,267 @@ export const makeCodexAdapterV2 = Effect.fn("makeCodexAdapterV2")(function* (
             }),
           );
 
+        const startMastraRunTracking = Effect.fn("CodexAdapterV2.startMastraRunTracking")(
+          function* (
+            context: ActiveCodexTurnContext,
+            nativeTurnId: string,
+            item: CodexDynamicToolItem,
+          ) {
+            const runId = mastraRunId(item);
+            if (runId === undefined || (item.type === "mcpToolCall" && item.error != null)) return;
+            const trackingKey = `${nativeTurnId}:${item.id}`;
+            const alreadyTracked = yield* Ref.modify(trackedMastraWorkflowItems, (tracked) => {
+              if (tracked.has(trackingKey)) return [true, tracked] as const;
+              return [false, new Set(tracked).add(trackingKey)] as const;
+            });
+            if (alreadyTracked) return;
+            const threadId = yield* getNativeThreadId(context.providerThread);
+            const runningItem: Extract<
+              CodexSchema.V2ItemCompletedNotification__ThreadItem,
+              { readonly type: "mcpToolCall" }
+            > = {
+              type: "mcpToolCall",
+              id: item.id,
+              server: item.type === "mcpToolCall" ? item.server : "mastra",
+              tool: item.type === "mcpToolCall" ? item.tool : "mastra_workflow_detached",
+              arguments: item.type === "mcpToolCall" ? item.arguments : {},
+              status: "inProgress",
+              result: {
+                ...(item.type === "mcpToolCall" ? item.result : undefined),
+                content: [{ type: "text", text: `Mastra workflow ${runId}: starting` }],
+              },
+            };
+            // With durable monitoring the server-side consumer owns the item; tracking it here
+            // would hold the turn open forever because only the fallback poller clears it.
+            if (!durableMastraMonitoringEnabled()) {
+              yield* trackRunningDynamicTool(nativeTurnId, runningItem);
+            }
+            const startingArtifacts = yield* buildDynamicToolArtifacts(context, runningItem);
+            // EventSink consumes this private handoff marker to atomically persist the monitor
+            // request with the live item update, then removes it before storing the UI event.
+            const monitorTurnItem =
+              context.projectionRunId === null
+                ? startingArtifacts.turnItem
+                : {
+                    ...startingArtifacts.turnItem,
+                    output: {
+                      __t3MastraWorkflowMonitor: {
+                        runId: context.projectionRunId,
+                        mastraRunId: runId,
+                      },
+                      result: startingArtifacts.turnItem.output,
+                    },
+                  };
+            yield* emitProviderEvent({
+              type: "node.updated",
+              driver: CODEX_PROVIDER,
+              node: startingArtifacts.node,
+            });
+            yield* emitProviderEvent({
+              type: "turn_item.updated",
+              driver: CODEX_PROVIDER,
+              turnItem: monitorTurnItem,
+            });
+            const offerWakeOnce = Effect.fn("CodexAdapterV2.offerMastraWakeOnce")(
+              (
+                detail: string,
+                outcome: "completed" | "failed" | "cancelled" | "updated",
+                summary: string,
+              ) =>
+                Effect.gen(function* () {
+                  if (continuationRequests === undefined) return;
+                  const wakeKey = `${trackingKey}:wake`;
+                  const alreadyOffered = yield* Ref.modify(trackedMastraWorkflowItems, (tracked) =>
+                    tracked.has(wakeKey)
+                      ? ([true, tracked] as const)
+                      : ([false, new Set(tracked).add(wakeKey)] as const),
+                  );
+                  if (alreadyOffered) return;
+                  yield* continuationRequests.offer({
+                    threadId: context.projectionThreadId,
+                    providerThreadId: context.providerThread.id,
+                    driver: CODEX_PROVIDER,
+                    delivery: "message_text",
+                    detail: detail.slice(0, MASTRA_RESULT_MAX_CHARS),
+                    notification: {
+                      source: { kind: "background_task" },
+                      outcome,
+                      summary,
+                    },
+                  });
+                }),
+            );
+            const poll = Effect.gen(function* () {
+              let finalState: "done" | "failed" | "cancelled" | undefined;
+              for (let attempt = 0; attempt < CODEX_MASTRA_RUN_POLL_LIMIT; attempt += 1) {
+                const statusResponse = yield* client.request("mcpServer/tool/call", {
+                  threadId,
+                  server: "mastra",
+                  tool: "mastra_status",
+                  arguments: { runId },
+                });
+                const rawStatus = mastraToolText(statusResponse);
+                const status = Option.getOrElse(decodeMastraRunStatus(rawStatus), () => ({
+                  state: undefined,
+                  currentStep: undefined,
+                  elapsedSec: undefined,
+                }));
+                const state = status.state;
+                if (state === "done" || state === "failed" || state === "cancelled") {
+                  finalState = state;
+                  break;
+                }
+                const step =
+                  status.currentStep !== undefined &&
+                  /^[A-Za-z0-9_-]{1,80}$/.test(status.currentStep)
+                    ? status.currentStep
+                    : undefined;
+                const elapsed =
+                  status.elapsedSec !== undefined &&
+                  Number.isFinite(status.elapsedSec) &&
+                  status.elapsedSec >= 0
+                    ? Math.min(Math.floor(status.elapsedSec), 31_536_000)
+                    : undefined;
+                const detail = [
+                  `Mastra workflow ${runId}: ${typeof state === "string" ? state : "running"}`,
+                  ...(step === undefined ? [] : [`Step: ${step}`]),
+                  ...(elapsed === undefined ? [] : [`Elapsed: ${elapsed}s`]),
+                ].join("\n");
+                const updated = {
+                  ...runningItem,
+                  result: { ...runningItem.result, content: [{ type: "text", text: detail }] },
+                };
+                const artifacts = yield* buildDynamicToolArtifacts(context, updated);
+                yield* emitProviderEvent({
+                  type: "node.updated",
+                  driver: CODEX_PROVIDER,
+                  node: artifacts.node,
+                });
+                yield* emitProviderEvent({
+                  type: "turn_item.updated",
+                  driver: CODEX_PROVIDER,
+                  turnItem: artifacts.turnItem,
+                });
+                yield* Effect.sleep(`${MASTRA_RUN_POLL_INTERVAL_MS} millis`);
+              }
+              let resultText: string;
+              if (finalState === undefined) {
+                resultText =
+                  `Mastra workflow ${runId} is still running. T3 monitoring paused after 60 minutes; ` +
+                  "call mastra_status with this runId to continue.";
+              } else {
+                const resultResponse = yield* client
+                  .request("mcpServer/tool/call", {
+                    threadId,
+                    server: "mastra",
+                    tool: "mastra_result",
+                    arguments: { runId },
+                  })
+                  .pipe(Effect.orElseSucceed(() => undefined));
+                const result =
+                  resultResponse === undefined
+                    ? "Final result is unavailable."
+                    : sanitizeMastraResult(mastraToolText(resultResponse));
+                resultText = `Mastra workflow ${runId}: ${finalState}\n\n${result.slice(0, MASTRA_RESULT_MAX_CHARS)}`;
+              }
+              const terminalItem: Extract<
+                CodexSchema.V2ItemCompletedNotification__ThreadItem,
+                { readonly type: "mcpToolCall" }
+              > = {
+                ...runningItem,
+                status:
+                  finalState === undefined || finalState === "cancelled"
+                    ? "inProgress"
+                    : finalState === "failed"
+                      ? "failed"
+                      : "completed",
+                result: { ...runningItem.result, content: [{ type: "text", text: resultText }] },
+              };
+              const artifacts = yield* buildDynamicToolArtifacts(context, terminalItem);
+              const terminalArtifacts =
+                finalState === "cancelled"
+                  ? {
+                      ...artifacts,
+                      node: { ...artifacts.node, status: "cancelled" as const },
+                      turnItem: { ...artifacts.turnItem, status: "cancelled" as const },
+                    }
+                  : artifacts;
+              yield* emitProviderEvent({
+                type: "node.updated",
+                driver: CODEX_PROVIDER,
+                node: terminalArtifacts.node,
+              });
+              yield* emitProviderEvent({
+                type: "turn_item.updated",
+                driver: CODEX_PROVIDER,
+                turnItem: terminalArtifacts.turnItem,
+              });
+              yield* offerWakeOnce(
+                resultText,
+                finalState === undefined
+                  ? "updated"
+                  : finalState === "done"
+                    ? "completed"
+                    : finalState === "cancelled"
+                      ? "cancelled"
+                      : "failed",
+                finalState === undefined
+                  ? `Mastra workflow ${runId} monitoring paused`
+                  : `Mastra workflow ${runId} ${finalState}`,
+              );
+            }).pipe(
+              Effect.catchCauseIf(
+                (cause) => !Cause.hasInterruptsOnly(cause),
+                () =>
+                  Effect.gen(function* () {
+                    const monitoringItem = {
+                      ...runningItem,
+                      status: "inProgress" as const,
+                      result: {
+                        ...runningItem.result,
+                        content: [
+                          {
+                            type: "text",
+                            text: `Mastra workflow ${runId} continues detached, but T3 could not update its status. Use mastra_status with this runId.`,
+                          },
+                        ],
+                      },
+                    };
+                    const artifacts = yield* buildDynamicToolArtifacts(context, monitoringItem);
+                    yield* emitProviderEvent({
+                      type: "node.updated",
+                      driver: CODEX_PROVIDER,
+                      node: artifacts.node,
+                    });
+                    yield* emitProviderEvent({
+                      type: "turn_item.updated",
+                      driver: CODEX_PROVIDER,
+                      turnItem: artifacts.turnItem,
+                    });
+                    yield* offerWakeOnce(
+                      `Mastra workflow ${runId} is still detached; T3 could not refresh its status. The remote run was not marked failed. Check mastra_status for runId ${runId}.`,
+                      "updated",
+                      `Mastra workflow ${runId} status monitoring interrupted`,
+                    );
+                  }).pipe(Effect.ignoreCause),
+              ),
+              Effect.ensuring(
+                Effect.gen(function* () {
+                  yield* clearRunningDynamicTool(nativeTurnId, item.id);
+                  if ((yield* Ref.get(settledTurns)).has(nativeTurnId)) {
+                    yield* releaseSettledTurnIfIdle(nativeTurnId);
+                  }
+                }),
+              ),
+            );
+            // The durable server-side event consumer owns terminal delivery when enabled.
+            // Keep the session-bound poller only as the explicit compatibility fallback.
+            if (!durableMastraMonitoringEnabled()) {
+              yield* poll.pipe(Effect.forkIn(scope, { startImmediately: true }), Effect.asVoid);
+            }
+          },
+        );
+
         const terminalizeMcpAppCaptures = Effect.fn("CodexAdapterV2.terminalizeMcpAppCaptures")(
           function* (context: ActiveCodexTurnContext, nativeTurnId: string) {
             const captures = (yield* Ref.get(pendingMcpAppCaptures)).get(nativeTurnId);
@@ -5125,6 +5517,9 @@ export const makeCodexAdapterV2 = Effect.fn("makeCodexAdapterV2")(function* (
                 driver: CODEX_PROVIDER,
                 turnItem: artifacts.turnItem,
               });
+              if (isMastraWorkflowCall(payload.item)) {
+                yield* startMastraRunTracking(context, payload.turnId, payload.item);
+              }
               if (settled) {
                 yield* releaseSettledTurnIfIdle(payload.turnId);
               }

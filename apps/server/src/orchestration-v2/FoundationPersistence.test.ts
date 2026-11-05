@@ -1852,6 +1852,77 @@ it.layer(layerTest)("orchestration V2 foundation persistence", (it) => {
     }),
   );
 
+  it.effect("persists Mastra monitor ownership so the effect can be replayed after recovery", () =>
+    Effect.gen(function* () {
+      const outbox = yield* EffectOutbox.EffectOutboxV2;
+      const commandId = CommandId.make("command:foundation-mastra-monitor-recovery");
+      const threadId = ThreadId.make("thread:foundation-mastra-monitor-recovery");
+      const request = {
+        type: "mastra-workflow.monitor" as const,
+        runId: RunId.make("run:foundation-mastra-monitor-recovery"),
+        turnItemId: TurnItemId.make("turn-item:foundation-mastra-monitor-recovery"),
+        providerThreadId: ProviderThreadId.make(
+          "provider-thread:foundation-mastra-monitor-recovery",
+        ),
+        mastraRunId: "mastra-run:recovery",
+        poll: 0,
+      };
+      const pending = {
+        id: "effect:foundation-mastra-monitor-recovery",
+        commandId,
+        threadId,
+        request,
+      };
+
+      yield* outbox.enqueue([pending]);
+      yield* outbox.enqueue([pending]);
+
+      const recovered = yield* outbox.get(pending.id);
+      assert.isTrue(Option.isSome(recovered));
+      if (Option.isSome(recovered)) {
+        assert.equal(recovered.value.status, "pending");
+        assert.deepEqual(recovered.value.request, request);
+        assert.equal(recovered.value.threadId, threadId);
+        assert.equal(recovered.value.id, pending.id);
+      }
+      const monitor = {
+        effectId: pending.id,
+        consumerId: "t3-environment-test",
+        threadId,
+        runId: request.runId,
+        turnItemId: request.turnItemId,
+        providerThreadId: request.providerThreadId,
+        mastraRunId: request.mastraRunId,
+      };
+      yield* outbox.registerMastraWorkflowMonitor(monitor);
+      yield* outbox.registerMastraWorkflowMonitor(monitor);
+      assert.deepEqual(yield* outbox.listMastraWorkflowMonitors, [monitor]);
+
+      const terminalIntent = {
+        consumerId: monitor.consumerId,
+        eventId: "event:foundation-mastra-terminal",
+        mastraRunId: monitor.mastraRunId,
+        threadId,
+        turnItemId: request.turnItemId,
+        state: "done",
+        stage: "complete",
+        outcomeJson: JSON.stringify({ summary: "Workflow completed successfully." }),
+        occurredAt: "2026-11-05T10:00:00.000Z",
+      };
+      yield* outbox.recordMastraWorkflowTerminalIntent(terminalIntent);
+      yield* outbox.recordMastraWorkflowTerminalIntent(terminalIntent);
+      assert.deepEqual(
+        yield* outbox.listMastraWorkflowTerminalIntents({ consumerId: monitor.consumerId }),
+        [terminalIntent],
+      );
+      yield* outbox.cancelUnsettled({
+        threadId,
+        effectTypes: ["mastra-workflow.monitor"],
+        reason: "Test cleanup",
+      });
+    }).pipe(Effect.provide(Layer.mergeAll(layerStoresProvided, layerEffectOutboxProvided))),
+  );
+
   it.effect("does not publish a stale provider start after an interrupt wins", () =>
     Effect.gen(function* () {
       const eventSink = yield* EventSink.EventSinkV2;

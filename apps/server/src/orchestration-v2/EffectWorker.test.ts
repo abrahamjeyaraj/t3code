@@ -11,6 +11,7 @@ import {
   RunId,
   RuntimeRequestId,
   ThreadId,
+  TurnItemId,
   VcsProcessExitError,
 } from "@t3tools/contracts";
 import * as Cause from "effect/Cause";
@@ -84,6 +85,7 @@ function layerExecutorFor(input: {
   readonly interrupt?: ProviderTurnControlService.ProviderTurnControlServiceV2Shape["interrupt"];
   readonly rollback?: CheckpointRollbackService.CheckpointRollbackServiceV2Shape["execute"];
   readonly respond?: RuntimeRequestService.RuntimeRequestServiceV2["Service"]["respond"];
+  readonly monitor?: EffectWorker.MastraWorkflowMonitorEventSourceShape["register"];
 }) {
   const record = (event: string) => Ref.update(input.events, (events) => [...events, event]);
   const layerDependencies = Layer.mergeAll(
@@ -155,6 +157,14 @@ function layerExecutorFor(input: {
         execute: () => Effect.void,
       }),
     ),
+    ...(input.monitor === undefined
+      ? []
+      : [
+          Layer.succeed(
+            EffectWorker.MastraWorkflowMonitorEventSource,
+            EffectWorker.MastraWorkflowMonitorEventSource.of({ register: input.monitor }),
+          ),
+        ]),
   );
   return EffectWorker.layerExecutor.pipe(
     Layer.provide(
@@ -168,6 +178,129 @@ function layerExecutorFor(input: {
     ),
   );
 }
+
+it.effect("registers persisted Mastra monitor ownership with the event source", () =>
+  Effect.gen(function* () {
+    const observed = yield* Ref.make<
+      ReadonlyArray<Parameters<EffectWorker.MastraWorkflowMonitorEventSourceShape["register"]>[0]>
+    >([]);
+    const effect: EffectOutbox.OrchestrationEffectV2 = {
+      id: "effect:mastra-monitor",
+      commandId: CommandId.make("command:mastra-monitor"),
+      threadId: ThreadId.make("thread:mastra-monitor"),
+      request: {
+        type: "mastra-workflow.monitor",
+        runId: RunId.make("run:mastra-monitor"),
+        turnItemId: TurnItemId.make("turn-item:mastra-monitor"),
+        providerThreadId,
+        mastraRunId: "mastra-run:123",
+        poll: 0,
+      },
+      status: "running",
+      attemptCount: 1,
+      availableAt: DateTime.formatIso(yield* DateTime.now),
+      leaseOwner: "test-worker",
+      createdAt: DateTime.formatIso(yield* DateTime.now),
+      updatedAt: DateTime.formatIso(yield* DateTime.now),
+      completedAt: null,
+      lastError: null,
+    };
+    const executor = yield* EffectWorker.OrchestrationEffectExecutorV2.pipe(
+      Effect.provide(
+        layerExecutorFor({
+          events: yield* Ref.make<ReadonlyArray<string>>([]),
+          monitor: (input) => Ref.update(observed, (items) => [...items, input]),
+        }),
+      ),
+    );
+
+    yield* executor.execute(effect);
+    yield* executor.execute(effect);
+
+    assert.deepEqual(yield* Ref.get(observed), [
+      {
+        effectId: "effect:mastra-monitor",
+        threadId: "thread:mastra-monitor",
+        runId: "run:mastra-monitor",
+        turnItemId: "turn-item:mastra-monitor",
+        providerThreadId,
+        mastraRunId: "mastra-run:123",
+        poll: 0,
+      },
+      {
+        effectId: "effect:mastra-monitor",
+        threadId: "thread:mastra-monitor",
+        runId: "run:mastra-monitor",
+        turnItemId: "turn-item:mastra-monitor",
+        providerThreadId,
+        mastraRunId: "mastra-run:123",
+        poll: 0,
+      },
+    ]);
+  }),
+);
+
+it.effect("keeps Mastra monitor work pending when its event source is unavailable", () =>
+  Effect.gen(function* () {
+    const now = DateTime.formatIso(yield* DateTime.now);
+    const effectId = "effect:mastra-monitor-unavailable";
+    const monitorEffect: EffectOutbox.OrchestrationEffectV2 = {
+      id: effectId,
+      commandId: CommandId.make("command:mastra-monitor-unavailable"),
+      threadId: ThreadId.make("thread:mastra-monitor-unavailable"),
+      request: {
+        type: "mastra-workflow.monitor",
+        runId: RunId.make("run:mastra-monitor-unavailable"),
+        turnItemId: TurnItemId.make("turn-item:mastra-monitor-unavailable"),
+        providerThreadId,
+        mastraRunId: "mastra-run:unavailable",
+        poll: 0,
+      },
+      status: "running",
+      attemptCount: 5,
+      availableAt: now,
+      leaseOwner: "test-worker",
+      createdAt: now,
+      updatedAt: now,
+      completedAt: null,
+      lastError: null,
+    };
+    const retried = yield* Ref.make(0);
+    const failed = yield* Ref.make(0);
+    const layerOutbox = Layer.mock(EffectOutbox.EffectOutboxV2)({
+      claimNext: () => Effect.succeedSome(monitorEffect),
+      get: () => Effect.succeedSome(monitorEffect),
+      awaitCancellation: () => Effect.never,
+      clearCancellation: () => Effect.void,
+      retry: () => Ref.update(retried, (count) => count + 1).pipe(Effect.as(true)),
+      fail: () => Ref.update(failed, (count) => count + 1).pipe(Effect.as(true)),
+    });
+    const layerExecutor = Layer.succeed(
+      EffectWorker.OrchestrationEffectExecutorV2,
+      EffectWorker.OrchestrationEffectExecutorV2.of({
+        execute: (effect) =>
+          Effect.fail(
+            new EffectWorker.OrchestrationEffectExecutionError({
+              effectId: effect.id,
+              effectType: effect.request.type,
+            }),
+          ),
+      }),
+    );
+    const layerWorker = EffectWorker.layerWithOptions({
+      workerId: "test-worker",
+      maxAttempts: 1,
+    }).pipe(Layer.provide(Layer.merge(layerOutbox, layerExecutor)));
+
+    yield* EffectWorker.OrchestrationEffectWorkerV2.pipe(
+      Effect.flatMap((worker) => worker.runOnce),
+      Effect.provide(layerWorker),
+    );
+
+    assert.equal(yield* Ref.get(retried), 1);
+    assert.equal(yield* Ref.get(failed), 0);
+  }),
+);
 
 it.effect.each([
   {

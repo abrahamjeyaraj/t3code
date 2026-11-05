@@ -205,6 +205,7 @@ export function runOrchestratorV2ProviderReplayScenario<
     readonly recoverOnStartup?: boolean;
     readonly continueThreadsAfterServerUpdate?: boolean;
     readonly managedPolicy?: ManagedPolicyDocument;
+    readonly realThreadManagement?: boolean;
   } = {},
 ): Effect.Effect<
   OrchestratorV2ScenarioResult,
@@ -248,6 +249,7 @@ export function layerProviderReplay<Transcript extends ProviderReplayTranscript,
     readonly recoverOnStartup?: boolean;
     readonly continueThreadsAfterServerUpdate?: boolean;
     readonly managedPolicy?: ManagedPolicyDocument;
+    readonly realThreadManagement?: boolean;
     readonly replayGate?: ProviderReplayGate;
   } = {},
 ): Layer.Layer<
@@ -255,7 +257,8 @@ export function layerProviderReplay<Transcript extends ProviderReplayTranscript,
   | EffectWorker.OrchestrationEffectWorkerV2
   | EventSink.EventSinkV2
   | CommandOutputRecorder.CommandOutputRecorder
-  | ProviderSessionManager.ProviderSessionManagerV2,
+  | ProviderSessionManager.ProviderSessionManagerV2
+  | ThreadManagementService.ThreadManagementService,
   Error | MigrationError | PlatformError.PlatformError | SqlError
 > {
   const layerRegistry = harness.makeProviderAdapterRegistryLayer(
@@ -282,12 +285,17 @@ export function layerWithRegistry<Error>(
     readonly recoverOnStartup?: boolean;
     readonly continueThreadsAfterServerUpdate?: boolean;
     readonly managedPolicy?: ManagedPolicyDocument;
+    readonly realThreadManagement?: boolean;
   } = {},
 ): Layer.Layer<
   | Orchestrator.OrchestratorV2
   | EffectWorker.OrchestrationEffectWorkerV2
   | EventSink.EventSinkV2
+  | EffectOutbox.EffectOutboxV2
+  | ProjectionStore.ProjectionStoreV2
+  | IdAllocator.IdAllocatorV2
   | ProviderSessionManager.ProviderSessionManagerV2
+  | ThreadManagementService.ThreadManagementService
   | CommandOutputRecorder.CommandOutputRecorder,
   Error | MigrationError | PlatformError.PlatformError | SqlError
 > {
@@ -491,18 +499,30 @@ export function layerWithRegistry<Error>(
       ),
     ),
   );
-  const layerThreadManagementProvided = Layer.unwrap(
-    Effect.gen(function* () {
-      const orchestrator = yield* Orchestrator.OrchestratorV2;
-      return Layer.mock(ThreadManagementService.ThreadManagementService)({
-        dispatch: orchestrator.dispatch,
-        getThreadRecords: orchestrator.getThreadRecords,
-        getThreadProjection: orchestrator.getThreadProjection,
-        recoverDelegatedTask: orchestrator.recoverDelegatedTask,
-        delegatedTaskResultPending: orchestrator.delegatedTaskResultPending,
-      });
-    }),
-  ).pipe(Layer.provide(layerOrchestratorProvided));
+  const layerThreadManagementProvided =
+    options.realThreadManagement === true
+      ? ThreadManagementService.layer.pipe(
+          Layer.provide(
+            Layer.mergeAll(
+              layerOrchestratorProvided,
+              layerProviderSessionManagerProvided,
+              layerServerSettings,
+              layerCommandReceiptStoreProvided,
+            ),
+          ),
+        )
+      : Layer.unwrap(
+          Effect.gen(function* () {
+            const orchestrator = yield* Orchestrator.OrchestratorV2;
+            return Layer.mock(ThreadManagementService.ThreadManagementService)({
+              dispatch: orchestrator.dispatch,
+              getThreadRecords: orchestrator.getThreadRecords,
+              getThreadProjection: orchestrator.getThreadProjection,
+              recoverDelegatedTask: orchestrator.recoverDelegatedTask,
+              delegatedTaskResultPending: orchestrator.delegatedTaskResultPending,
+            });
+          }),
+        ).pipe(Layer.provide(layerOrchestratorProvided));
   const layerContinuationWorkerProvided =
     options.runContinuationWorker === true
       ? ProviderContinuationService.layer.pipe(
@@ -538,6 +558,9 @@ export function layerWithRegistry<Error>(
     layerProviderSessionManagerProvided,
     layerEffectWorkerProvided,
     layerEventSinkProvided,
+    layerThreadManagementProvided,
+    layerStores,
+    IdAllocator.layer,
     layerContinuationWorkerProvided,
     layerCommandOutputHubProvided,
   ).pipe(
