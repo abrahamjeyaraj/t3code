@@ -1360,6 +1360,19 @@ export function createServerEnvironmentAtoms<R, E>(
           ),
         ),
     }),
+    // Sidebar only needs `enabled`; the page polls while it is mounted.
+    mastraPanelStatus: createEnvironmentRpcQueryAtomFamily(runtime, {
+      label: "environment-data:server:mastra-panel-status",
+      tag: WS_METHODS.serverGetMastraPanel,
+      staleTimeMs: 60_000,
+    }),
+    mastraPanel: createEnvironmentRpcQueryAtomFamily(runtime, {
+      label: "environment-data:server:mastra-panel",
+      tag: WS_METHODS.serverGetMastraPanel,
+      staleTimeMs: 10_000,
+      refreshIntervalMs: 15_000,
+      idleTtlMs: 0,
+    }),
     resourceTelemetry: createEnvironmentRpcSubscriptionAtomFamily(runtime, {
       label: "environment-data:server:resource-telemetry",
       tag: WS_METHODS.subscribeResourceTelemetry,

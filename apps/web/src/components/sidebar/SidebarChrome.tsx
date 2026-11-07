@@ -1,4 +1,4 @@
-import { ArrowLeftIcon, ArrowRightIcon, ChartNoAxesColumnIcon, SettingsIcon } from "lucide-react";
+import { ArrowLeftIcon, ArrowRightIcon, ChartNoAxesColumnIcon, SettingsIcon, WorkflowIcon } from "lucide-react";
 import type { ReactNode } from "react";
 import { memo } from "react";
 import { Link, useLocation, useNavigate } from "@tanstack/react-router";
@@ -13,6 +13,7 @@ import {
 } from "../../navigationHistory";
 import { primaryServerKeybindingsAtom } from "../../state/server";
 import { cn } from "../../lib/utils";
+import { useMastraPanelEnabled } from "../../lib/mastraPanelState";
 import { usePullRequestsSupported } from "../../state/environments";
 import { T3Wordmark } from "../T3Wordmark";
 import {
@@ -226,6 +227,7 @@ const SidebarUtilityMenu = memo(function SidebarUtilityMenu() {
     select: (location) => isSidebarUtilityPage(location.pathname),
   });
   const pullRequestsSupported = usePullRequestsSupported();
+  const mastraEnabled = useMastraPanelEnabled();
   const closeMobileSidebar = () => {
     if (isMobile) {
       setOpenMobile(false);
@@ -237,6 +239,10 @@ const SidebarUtilityMenu = memo(function SidebarUtilityMenu() {
       to: "/pull-requests",
       search: readPullRequestListPreferences(),
     });
+  };
+  const handleMastraClick = () => {
+    closeMobileSidebar();
+    void navigate({ to: "/mastra" });
   };
   const handleSettingsClick = () => {
     closeMobileSidebar();
@@ -277,6 +283,9 @@ const SidebarUtilityMenu = memo(function SidebarUtilityMenu() {
               label="Pull requests"
               onClick={handlePullRequestsClick}
             />
+          ) : null}
+          {mastraEnabled ? (
+            <SidebarUtilityItem icon={<WorkflowIcon />} label="Mastra" onClick={handleMastraClick} />
           ) : null}
           <SidebarUtilityItem
             icon={<ChartNoAxesColumnIcon />}
