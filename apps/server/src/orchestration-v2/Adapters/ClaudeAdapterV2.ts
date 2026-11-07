@@ -24,6 +24,7 @@ import {
   mergeClaudeWorkflowProgress,
   parseClaudeWorkflowRunHandles,
 } from "./claudeWorkflowProgress.ts";
+import { durableMastraMonitoringEnabled, parseMastraRunId } from "./CodexAdapterV2.ts";
 
 import { isWorkspaceImagePreviewPath } from "@t3tools/shared/filePreview";
 import {
@@ -3337,6 +3338,30 @@ function claudeNativeToolOutputValue(output: ClaudeNativeToolOutput): unknown | 
     default:
       return assertNever(output);
   }
+}
+
+/** Detached Mastra workflow runs started through MCP; only active with the durable event host. */
+export function claudeMastraWorkflowRunId(
+  toolName: string,
+  output: ClaudeNativeToolOutput,
+): string | undefined {
+  if (!durableMastraMonitoringEnabled()) return undefined;
+  if (!/^mcp__mastra__mastra_workflow_[A-Za-z0-9_]+$/u.test(toolName)) return undefined;
+  const value = claudeNativeToolOutputValue(output);
+  const candidates: unknown[] = [value];
+  if (Array.isArray(value)) candidates.push({ content: value });
+  if (typeof value === "string") {
+    try {
+      candidates.push(JSON.parse(value));
+    } catch {
+      // Plain text is not a run identity.
+    }
+  }
+  for (const candidate of candidates) {
+    const runId = parseMastraRunId(candidate);
+    if (runId !== undefined) return runId;
+  }
+  return undefined;
 }
 
 function claudeNativeToolOutputText(output: ClaudeNativeToolOutput): string {
@@ -7556,8 +7581,7 @@ export const makeClaudeAdapterV2 = Effect.fn("makeClaudeAdapterV2")(function* (
             input.toolResult.tool_use_id,
           );
           yield* stopTaskOutputTail(toolCall.nativeItemId);
-          yield* emitToolCallArtifacts(
-            buildToolCallArtifacts({
+          const settledArtifacts = buildToolCallArtifacts({
               context: input.context,
               nativeItemId: toolCall.nativeItemId,
               toolName: toolCall.toolName,
@@ -7579,7 +7603,27 @@ export const makeClaudeAdapterV2 = Effect.fn("makeClaudeAdapterV2")(function* (
               startedAt: toolCall.startedAt,
               updatedAt: input.completedAt,
               presentation: toolCall.presentation,
-            }),
+            });
+          const mastraRunId =
+            toolNonExecutionKind === undefined && !isClaudeToolResultError(input.toolResult)
+              ? claudeMastraWorkflowRunId(toolCall.toolName, input.output)
+              : undefined;
+          yield* emitToolCallArtifacts(
+            mastraRunId === undefined ||
+              toolCall.runId === null ||
+              settledArtifacts.turnItem.type !== "dynamic_tool"
+              ? settledArtifacts
+              : {
+                  ...settledArtifacts,
+                  // EventSink consumes this private marker to persist the monitor request with the item.
+                  turnItem: {
+                    ...settledArtifacts.turnItem,
+                    output: {
+                      __t3MastraWorkflowMonitor: { runId: toolCall.runId, mastraRunId },
+                      result: settledArtifacts.turnItem.output,
+                    },
+                  },
+                },
           );
           input.registry.delete(toolCall.nativeItemId);
         });

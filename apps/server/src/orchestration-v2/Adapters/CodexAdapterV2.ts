@@ -537,7 +537,7 @@ function isMastraWorkflowCall(item: CodexDynamicToolItem): boolean {
   return mastraRunId(item) !== undefined;
 }
 
-function parseMastraRunId(value: unknown): string | undefined {
+export function parseMastraRunId(value: unknown): string | undefined {
   const structured = value;
   if (structured !== null && typeof structured === "object" && !Array.isArray(structured)) {
     const runId = Option.getOrElse(decodeMastraRunIdentity(structured), () => ({
